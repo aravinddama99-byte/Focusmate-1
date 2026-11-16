@@ -1,107 +1,122 @@
-// FocusMate friends server: Google sign-in check, unique 8-digit friend codes, shared XP/stats.
-// No dependencies. Run: node server.js   (PORT, DATA_FILE, GOOGLE_CLIENT_ID are optional env vars)
-const http = require('http'), https = require('https'), fs = require('fs'), crypto = require('crypto');
+// FocusMate server: verifies Google sign-in, stores each user's data in PostgreSQL, friend codes and shared XP.
+// Env: DATABASE_URL (required), GOOGLE_CLIENT_ID (required, your Web client ID; comma-separate several),
+//      PORT, ALLOWED_DOMAINS="cuchd.in,cumail.in", ALLOWED_EMAILS="a@x.com,b@y.com"  (if both are empty, any Google account may sign in)
+const http = require('http');
+const db = require('./db');
+const { verifyGoogleIdToken } = require('./google');
+
 const PORT = process.env.PORT || 8788;
-const DATA_FILE = process.env.DATA_FILE || './data.json';
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';   // your Web client ID; when set, Google ID tokens are verified
+const list = (v) => (process.env[v] || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+const AUDIENCES = (process.env.GOOGLE_CLIENT_ID || '').split(',').map((x) => x.trim()).filter(Boolean);
+const ALLOWED_DOMAINS = list('ALLOWED_DOMAINS'), ALLOWED_EMAILS = list('ALLOWED_EMAILS');
+const allowed = (email) => (!ALLOWED_DOMAINS.length && !ALLOWED_EMAILS.length) || ALLOWED_EMAILS.includes(email) || ALLOWED_DOMAINS.includes(email.split('@')[1]);
 
-let db = { users: {}, byEmail: {}, byCode: {}, byToken: {} };
-try { db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) {}
-let dirty = false;
-setInterval(() => { if (dirty) { try { fs.writeFileSync(DATA_FILE, JSON.stringify(db)); dirty = false; } catch (e) {} } }, 3000);
-process.on('SIGTERM', () => { try { fs.writeFileSync(DATA_FILE, JSON.stringify(db)); } catch (e) {} process.exit(0); });
+if (!AUDIENCES.length) {
+  console.error('GOOGLE_CLIENT_ID is not set. Without it anyone could pretend to be any user, so the server will not start.');
+  process.exit(1);
+}
 
-function newCode() {
-  for (;;) {
-    const c = String(crypto.randomInt(10000000, 100000000));   // 8 digits, never starts with 0
-    if (!db.byCode[c]) return c;
-  }
-}
-function verifyGoogle(idToken) {
-  return new Promise((resolve) => {
-    https.get('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken), (r) => {
-      let d = ''; r.on('data', (x) => d += x);
-      r.on('end', () => { try { const j = JSON.parse(d); resolve(r.statusCode === 200 && j.aud === GOOGLE_CLIENT_ID && j.email ? j : null); } catch (e) { resolve(null); } });
-    }).on('error', () => resolve(null));
-  });
-}
-const pub = (u) => ({ id: u.code, code: u.code, name: u.name, username: u.username, ...u.profile, updatedAt: u.updatedAt });
 const num = (v) => (typeof v === 'number' && isFinite(v) ? Math.max(0, Math.round(v)) : null);
+const MAX_BODY = 4 * 1024 * 1024;
 
 function send(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'POST, GET, OPTIONS' });
   res.end(JSON.stringify(obj));
 }
 function body(req) {
-  return new Promise((resolve) => { let d = ''; req.on('data', (x) => { d += x; if (d.length > 50000) req.destroy(); }); req.on('end', () => { try { resolve(JSON.parse(d || '{}')); } catch (e) { resolve({}); } }); });
+  return new Promise((resolve) => {
+    let d = '', big = false;
+    req.on('data', (x) => { if (big) return; d += x; if (d.length > MAX_BODY) { big = true; d = ''; } });
+    req.on('end', () => { if (big) return resolve(null); try { resolve(JSON.parse(d || '{}')); } catch (e) { resolve({}); } });
+  });
 }
-function authed(req) {
-  const t = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  const email = db.byToken[t];
-  return email ? db.users[email] : null;
-}
-function friendsOf(u) { return (u.friends || []).map((c) => db.users[db.byCode[c]]).filter(Boolean).map(pub); }
+const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
 
-http.createServer(async (req, res) => {
+async function handle(req, res) {
   if (req.method === 'OPTIONS') return send(res, 204, {});
-  if (req.method === 'GET' && req.url === '/') return send(res, 200, { ok: true, name: 'focusmate-friends' });
+  if (req.method === 'GET' && req.url === '/') {
+    let ok = true; try { await db.ping(); } catch (e) { ok = false; }
+    return send(res, ok ? 200 : 503, { ok, name: 'focusmate', db: ok });
+  }
   if (req.method !== 'POST') return send(res, 404, { error: 'Not found' });
   const b = await body(req);
+  if (b === null) return send(res, 413, { error: 'Too much data' });
 
   if (req.url === '/auth') {
-    let email = String(b.email || '').toLowerCase().trim(), name = String(b.name || '').trim();
-    if (GOOGLE_CLIENT_ID) {
-      const g = b.idToken ? await verifyGoogle(b.idToken) : null;
-      if (!g) return send(res, 401, { error: 'Google sign-in could not be verified' });
-      email = g.email.toLowerCase(); name = name || g.name || '';
-    }
-    if (!/^[^@\s]+@[^@\s]+$/.test(email)) return send(res, 400, { error: 'Email required' });
-    let u = db.users[email];
-    if (!u) {
-      u = db.users[email] = { email, name: name || email.split('@')[0], username: email.split('@')[0].replace(/[^a-z0-9_]/gi, '').toLowerCase(), code: newCode(), friends: [], profile: {}, updatedAt: Date.now() };
-      db.byEmail[email] = email; db.byCode[u.code] = email;
-    }
-    const token = crypto.randomBytes(24).toString('hex');
-    db.byToken[token] = email; dirty = true;
-    return send(res, 200, { token, code: u.code, friends: friendsOf(u) });
+    const g = await verifyGoogleIdToken(b.idToken, AUDIENCES);
+    if (!g) return send(res, 401, { error: 'Google sign-in could not be verified' });
+    if (!allowed(g.email)) return send(res, 403, { error: 'FocusMate is only for CU students. Please sign in with your CU email.' });
+    const u = await db.upsertUser(g);
+    const token = await db.createSession(u.id);
+    return send(res, 200, { token, code: u.friend_code, user: { name: u.name, email: u.email, picture: u.picture }, friends: await db.friendsOf(u.id) });
   }
 
-  const u = authed(req);
+  const token = bearer(req);
+  const u = await db.userForToken(token);
   if (!u) return send(res, 401, { error: 'Please sign in again' });
 
-  if (req.url === '/sync') {
-    const p = b.profile || {};
-    if (typeof p.name === 'string' && p.name.trim()) u.name = p.name.trim().slice(0, 40);
-    if (typeof p.username === 'string' && p.username.trim()) u.username = p.username.trim().slice(0, 30);
-    u.profile = {
-      course: String(p.course || '').slice(0, 60),
-      xp: num(p.xp), level: String(p.level || '').slice(0, 20), streak: num(p.streak),
-      weeklyMin: num(p.weeklyMin), monthlyMin: num(p.monthlyMin), todayMin: num(p.todayMin),
-      tasksDone: num(p.tasksDone), todayGoalMin: num(p.todayGoalMin), focusing: !!p.focusing,
-    };
-    u.updatedAt = Date.now(); dirty = true;
-    return send(res, 200, { code: u.code, friends: friendsOf(u) });
-  }
-  if (req.url === '/connect') {
-    const code = String(b.code || '').replace(/\D/g, '');
-    if (code.length !== 8) return send(res, 400, { error: 'A friend code has 8 digits' });
-    if (code === u.code) return send(res, 400, { error: "That's your own code" });
-    const em = db.byCode[code];
-    if (!em) return send(res, 404, { error: 'No one has that code' });
-    const f = db.users[em];
-    if ((u.friends || []).includes(code)) return send(res, 409, { error: 'Already friends' });
-    u.friends = [...(u.friends || []), code];
-    f.friends = [...(f.friends || []), u.code];
-    dirty = true;
-    return send(res, 200, { ok: true, friend: pub(f), friends: friendsOf(u) });
-  }
-  if (req.url === '/unfriend') {
-    const code = String(b.code || '');
-    const em = db.byCode[code];
-    u.friends = (u.friends || []).filter((c) => c !== code);
-    if (em) db.users[em].friends = (db.users[em].friends || []).filter((c) => c !== u.code);
-    dirty = true;
-    return send(res, 200, { ok: true, friends: friendsOf(u) });
+  switch (req.url) {
+    case '/logout':
+      await db.deleteSession(token);
+      return send(res, 200, { ok: true });
+
+    case '/sync': {
+      const p = b.profile || {};
+      const name = typeof p.name === 'string' && p.name.trim() ? p.name.trim().slice(0, 40) : null;
+      const username = typeof p.username === 'string' && p.username.trim() ? p.username.trim().slice(0, 30) : null;
+      await db.saveProfile(u.id, name, username, {
+        course: String(p.course || '').slice(0, 60),
+        xp: num(p.xp), level: String(p.level || '').slice(0, 20), streak: num(p.streak),
+        weeklyMin: num(p.weeklyMin), monthlyMin: num(p.monthlyMin), todayMin: num(p.todayMin),
+        tasksDone: num(p.tasksDone), todayGoalMin: num(p.todayGoalMin), focusing: !!p.focusing,
+      });
+      return send(res, 200, { code: u.friend_code, friends: await db.friendsOf(u.id) });
+    }
+
+    case '/connect': {
+      const code = String(b.code || '').replace(/\D/g, '');
+      if (code.length !== 8) return send(res, 400, { error: 'A friend code has 8 digits' });
+      if (code === u.friend_code) return send(res, 400, { error: "That's your own code" });
+      const f = await db.userByCode(code);
+      if (!f) return send(res, 404, { error: 'No one has that code' });
+      if (await db.isFriend(u.id, f.id)) return send(res, 409, { error: 'Already friends' });
+      await db.connect(u.id, f.id);
+      return send(res, 200, { ok: true, friend: await db.publicFriend(f.id), friends: await db.friendsOf(u.id) });
+    }
+
+    case '/unfriend': {
+      const f = await db.userByCode(String(b.code || ''));
+      if (f) await db.unfriend(u.id, f.id);
+      return send(res, 200, { ok: true, friends: await db.friendsOf(u.id) });
+    }
+
+    // Everything the app keeps (tasks, sessions, XP, settings, chat...) saved to this Google account.
+    case '/state/load':
+      return send(res, 200, (await db.loadDoc('app_state', u.id)) || { data: null, updatedAt: 0 });
+    case '/state/save': {
+      const d = b.data;
+      if (!d || typeof d !== 'object' || Array.isArray(d)) return send(res, 400, { error: 'Bad data' });
+      const r = await db.saveDoc('app_state', u.id, d, b.base, !!b.force);
+      return send(res, r.ok ? 200 : 409, r.ok ? { ok: true, updatedAt: r.updatedAt } : { error: 'Newer data exists', updatedAt: r.updatedAt });
+    }
+
+    // Academics (attendance, timetable): last write wins, the app compares its own timestamps.
+    case '/acad/save': {
+      const d = b.data;
+      if (!d || typeof d !== 'object' || !Array.isArray(d.subjects)) return send(res, 400, { error: 'Bad data' });
+      await db.saveDoc('academics', u.id, d, 0, true);
+      return send(res, 200, { ok: true });
+    }
+    case '/acad/load': {
+      const r = await db.loadDoc('academics', u.id);
+      return send(res, 200, { data: r ? r.data : null });
+    }
   }
   return send(res, 404, { error: 'Not found' });
-}).listen(PORT, () => console.log('FocusMate friends server on :' + PORT));
+}
+
+db.init().then(() => {
+  http.createServer((req, res) => {
+    handle(req, res).catch((e) => { console.error(req.url, e); if (!res.headersSent) send(res, 500, { error: 'Server error' }); });
+  }).listen(PORT, () => console.log('FocusMate server on :' + PORT));
+}).catch((e) => { console.error('Could not start (database?):', e.message); process.exit(1); });
